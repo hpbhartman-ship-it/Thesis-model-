@@ -59,5 +59,5 @@ plt.title("Hourly PV output")
 plt.grid(True)
 plt.show()
 
-
-even testen met eenb verasssing 
+# testen hoe dit nu gaat
+# nog een keer testen 
