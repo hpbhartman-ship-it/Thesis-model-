@@ -59,47 +59,33 @@ if len(hourly_energy_per_m2_kwh) != sum(hours_per_month):
     )
 
 monthly_energy_per_m2_kwh = []
-monthly_area_required_m2 = []
 start_idx = 0
 for hours in hours_per_month:
     end_idx = start_idx + hours
     month_energy_m2 = hourly_energy_per_m2_kwh.iloc[start_idx:end_idx].sum()
     monthly_energy_per_m2_kwh.append(month_energy_m2)
-    monthly_area_required_m2.append(monthly_ammonia_energy_kwh / month_energy_m2)
     start_idx = end_idx
 
 monthly_energy_per_m2_kwh = pd.Series(monthly_energy_per_m2_kwh, index=range(1, 13))
-monthly_area_required_m2 = pd.Series(monthly_area_required_m2, index=range(1, 13))
-
-required_field_area_m2 = monthly_area_required_m2.max()
-installed_power_capacity_mw = required_field_area_m2 * max_irradiance * efficiency / 1e6
-
-print(f"Required field area to meet every monthly target: {required_field_area_m2:,.0f} m^2")
-print(f"Installed power capacity at {efficiency*100:.0f}% efficiency: {installed_power_capacity_mw:.2f} MW")
-
-# Monthly energy generation for the required field area
-monthly_generated_kwh = monthly_energy_per_m2_kwh * required_field_area_m2
-monthly_target_kwh = pd.Series([monthly_ammonia_energy_kwh] * 12, index=range(1, 13))
-for month in range(1, 13):
-    print(
-        f"Month {month:2d}: generated {monthly_generated_kwh[month]:,.0f} kWh, "
-        f"target {monthly_ammonia_energy_kwh:,.0f} kWh"
-    )
 
 # --------------------------------------------------
-# 4. Battery / electrolyzer sizing
+# 4. Simulation with fixed design parameters
 # --------------------------------------------------
 
-energy_h2_per_kg_ammonia_kwh = 7
-energy_synthesis_per_kg_ammonia_kwh = 3
-monthly_h2_energy_kwh = ammonia_target_ton_per_month * 1000 * energy_h2_per_kg_ammonia_kwh
-monthly_synthesis_energy_kwh = ammonia_target_ton_per_month * 1000 * energy_synthesis_per_kg_ammonia_kwh
-print(f"Monthly H2 energy demand: {monthly_h2_energy_kwh:,.0f} kWh")
-print(f"Monthly synthesis energy demand: {monthly_synthesis_energy_kwh:,.0f} kWh")
+# Fixed design parameters (supervisor-specified)
+sim_field_area_m2   = 12_500   # m²
+sim_storage_mwh     = 7.5      # MWh
+sim_electrolyzer_mw = 0.5      # MW
 
-hourly_power_mw = hourly_energy_per_m2_kwh * required_field_area_m2 / 1000
+sim_pv_mw = sim_field_area_m2 * max_irradiance * efficiency / 1e6
+
+print(f"\n--- Simulation design parameters ---")
+print(f"Solar field:  {sim_field_area_m2:,} m²  ({sim_pv_mw:.3f} MW peak)")
+print(f"Battery:      {sim_storage_mwh} MWh")
+print(f"Electrolyzer: {sim_electrolyzer_mw} MW")
+
+
 monthly_target_energy_kwh = pd.Series([monthly_ammonia_energy_kwh] * 12, index=range(1, 13))
-
 hours_per_month = [744, 672, 744, 720, 744, 720, 744, 744, 720, 744, 720, 744]
 
 
@@ -129,7 +115,9 @@ def simulate_ammonia_plant(electrolyzer_limit_mw, storage_capacity_mwh, field_ar
 
     for h in range(n_hours):
         solar_power_mw = float(hourly_power_mw_local.iloc[h])
-        battery_possible = min(current_storage * eta_discharge, electrolyzer_limit_mw - solar_power_mw)
+        # HB draws 3/7 of electrolyzer power simultaneously; total plant limit = electrolyzer × 10/7
+        battery_possible = min(current_storage * eta_discharge,
+                               electrolyzer_limit_mw * (10.0 / 7.0) - solar_power_mw)
         battery_possible = max(0.0, battery_possible)
         total_available_power = solar_power_mw + battery_possible
 
@@ -164,7 +152,8 @@ def simulate_ammonia_plant(electrolyzer_limit_mw, storage_capacity_mwh, field_ar
             current_storage -= draw
             excess = max(0.0, solar_power_mw - equilibrium_threshold_mw)
             current_storage = min(current_storage + excess * eta_charge, storage_capacity_mwh)
-            if total_available_power >= minimum_production_limit_mw:
+            # Need enough for electrolyzer minimum AND proportional HB draw
+            if total_available_power >= minimum_production_limit_mw * (10.0 / 7.0):
                 plant_state = "producing"
             elif total_available_power < equilibrium_threshold_mw:
                 plant_state = "rampdown"
@@ -174,16 +163,20 @@ def simulate_ammonia_plant(electrolyzer_limit_mw, storage_capacity_mwh, field_ar
             available_solar = solar_power_mw
             available_battery = current_storage * eta_discharge
             available_total = available_solar + available_battery
-            if available_total >= minimum_production_limit_mw:
-                prod_power = min(electrolyzer_limit_mw, available_total)
-                battery_needed = max(0.0, prod_power - available_solar)
+            # Check minimum: available for electrolyzer (7/10 of total) must meet its minimum
+            if available_total * (7.0 / 10.0) >= minimum_production_limit_mw:
+                # Electrolyzer power capped by its own limit and available power
+                prod_power_elec = min(electrolyzer_limit_mw, available_total * (7.0 / 10.0))
+                # HB runs proportionally; total plant draw = electrolyzer × 10/7
+                prod_power_total = prod_power_elec * (10.0 / 7.0)
+                battery_needed = max(0.0, prod_power_total - available_solar)
                 battery_draw_actual = min(battery_needed / eta_discharge, current_storage)
                 real_battery_power = battery_draw_actual * eta_discharge
-                real_solar_power = min(prod_power, available_solar)
-                real_total_power = real_solar_power + real_battery_power
+                real_solar_power = min(prod_power_total, available_solar)
+                real_total_power = real_solar_power + real_battery_power  # electrolyzer + HB
                 ammonia_power_used[h] = real_total_power
                 current_storage -= battery_draw_actual
-                excess_solar = max(0.0, solar_power_mw - ammonia_power_used[h])
+                excess_solar = max(0.0, solar_power_mw - real_total_power)
                 current_storage = min(current_storage + excess_solar * eta_charge, storage_capacity_mwh)
             else:
                 plant_state = "standby"
@@ -235,146 +228,239 @@ def simulate_ammonia_plant(electrolyzer_limit_mw, storage_capacity_mwh, field_ar
     monthly_energy_used_kwh = pd.Series(monthly_energy_used_kwh, index=range(1, 13))
 
     battery_loss_mwh = battery_charged_total * (1 - eta_charge) + battery_discharged_total * (1 - eta_discharge)
+    total_power_series = pd.Series(ammonia_power_used)
     return {
         "success": all(monthly_energy_used_kwh >= monthly_target_energy_kwh),
         "monthly_energy_used_kwh": monthly_energy_used_kwh,
         "storage_level": pd.Series(storage_level),
-        "ammonia_power_used_mw": pd.Series(ammonia_power_used),
+        "ammonia_power_used_mw": total_power_series,
+        "electrolyzer_power_mw": total_power_series * (7.0 / 10.0),
+        "hb_power_mw": total_power_series * (3.0 / 10.0),
+        "plant_state_num": pd.Series(plant_state_num),
         "battery_loss_mwh": battery_loss_mwh,
         "battery_charged_total_mwh": battery_charged_total,
         "battery_discharged_total_mwh": battery_discharged_total,
     }
 
-# Cost weights — adjust these to reflect relative capital costs
-cost_weight_pv_per_mw = 1.0
-cost_weight_elec_per_mw = 1.0
-cost_weight_bat_per_mwh = 0.1
-
-# Field area candidates: fractions of the worst-month-sized area
-candidate_field_areas_m2 = [required_field_area_m2 * f for f in [0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5]]
-# Electrolyzer candidates: 0.5 to 5.0 MW in 0.5 MW steps
-candidate_limits_mw = [i * 0.5 for i in range(1, 11)]
-
-best_solution = None
-best_partial = None
-
-for field_area in candidate_field_areas_m2:
-    pv_mw = field_area * max_irradiance * efficiency / 1e6
-    for limit_mw in candidate_limits_mw:
-        print(f"  PV {pv_mw:.2f} MW, electrolyzer {limit_mw:.1f} MW ...", end=" ", flush=True)
-        feasible_storage = None
-        for storage_mwh in range(0, 101):
-            result = simulate_ammonia_plant(limit_mw, float(storage_mwh), field_area)
-            if result["success"]:
-                feasible_storage = storage_mwh
-                break
-            months_ok = int((result["monthly_energy_used_kwh"] >= monthly_target_energy_kwh).sum())
-            if best_partial is None or months_ok > best_partial["months_ok"]:
-                best_partial = {
-                    "field_area_m2": field_area, "limit_mw": limit_mw,
-                    "storage_mwh": storage_mwh, "months_ok": months_ok, "result": result,
-                }
-        if feasible_storage is not None:
-            cost = (cost_weight_pv_per_mw * pv_mw
-                    + cost_weight_elec_per_mw * limit_mw
-                    + cost_weight_bat_per_mwh * feasible_storage)
-            print(f"feasible at {feasible_storage} MWh battery (cost={cost:.2f})")
-            if best_solution is None or cost < best_solution["cost"]:
-                best_solution = {
-                    "field_area_m2": field_area, "limit_mw": limit_mw,
-                    "storage_mwh": feasible_storage, "cost": cost, "result": result,
-                }
-        else:
-            print("no feasible storage found")
-
-if best_solution is None:
-    print("\nNo fully feasible solution found. Best partial result:")
-    bp = best_partial
-    bp_pv_mw = bp["field_area_m2"] * max_irradiance * efficiency / 1e6
-    print(f"  PV: {bp_pv_mw:.2f} MW ({bp['field_area_m2']:,.0f} m²), "
-          f"Electrolyzer: {bp['limit_mw']:.1f} MW, Battery: {bp['storage_mwh']} MWh")
-    print(f"  Months meeting target: {bp['months_ok']}/12")
-    for month in range(1, 13):
-        produced = bp["result"]["monthly_energy_used_kwh"][month]
-        shortfall = monthly_target_energy_kwh[month] - produced
-        status = "OK" if shortfall <= 0 else f"SHORT by {shortfall:,.0f} kWh"
-        print(f"  Month {month:2d}: {produced:,.0f} kWh  [{status}]")
-    raise RuntimeError("No feasible solution found. Widen the search grid.")
-
-opt_field_area_m2 = best_solution["field_area_m2"]
-opt_pv_mw = opt_field_area_m2 * max_irradiance * efficiency / 1e6
-opt_limit_mw = best_solution["limit_mw"]
-opt_storage_mwh = best_solution["storage_mwh"]
-opt_result = best_solution["result"]
-
-print(f"\nOptimal solar field area: {opt_field_area_m2:,.0f} m²  ({opt_pv_mw:.2f} MW installed)")
-print(f"Optimal electrolyzer limit: {opt_limit_mw:.2f} MW")
-print(f"Optimal battery capacity: {opt_storage_mwh:.0f} MWh")
-print(f"Total battery losses: {opt_result['battery_loss_mwh']:.2f} MWh")
-
-for month in range(1, 13):
-    produced = opt_result["monthly_energy_used_kwh"][month]
-    target = monthly_ammonia_energy_kwh
-    print(f"Month {month:2d}: produced {produced:,.0f} kWh, target {target:,.0f} kWh")
+sim_result = simulate_ammonia_plant(sim_electrolyzer_mw, sim_storage_mwh, sim_field_area_m2)
 
 # --------------------------------------------------
-# 5. Plot monthly production vs target use
+# Annual energy balance
+# --------------------------------------------------
+
+eta_charge    = 0.92
+eta_discharge = 0.92
+
+total_solar_mwh    = (hourly_energy_per_m2_kwh * sim_field_area_m2 / 1000).sum()
+total_ammonia_mwh  = sim_result["monthly_energy_used_kwh"].sum() / 1000
+bat_charged_mwh    = sim_result["battery_charged_total_mwh"]
+bat_discharged_mwh = sim_result["battery_discharged_total_mwh"]
+bat_losses_mwh     = sim_result["battery_loss_mwh"]
+final_battery_mwh  = float(sim_result["storage_level"].iloc[-1])
+
+# Solar splits into: direct to plant | into battery (input) | curtailed
+solar_direct_mwh   = total_ammonia_mwh - bat_discharged_mwh * eta_discharge
+solar_to_bat_mwh   = bat_charged_mwh / eta_charge
+curtailed_mwh      = total_solar_mwh - solar_direct_mwh - solar_to_bat_mwh
+
+# Electrolyzer / HB split (proportional by energy fraction)
+total_elec_mwh = total_ammonia_mwh * (7.0 / 10.0)
+total_hb_mwh   = total_ammonia_mwh * (3.0 / 10.0)
+
+annual_target_mwh = monthly_ammonia_energy_kwh * 12 / 1000
+months_met = int((sim_result["monthly_energy_used_kwh"] >= monthly_target_energy_kwh).sum())
+
+print(f"\n--- Annual energy balance ---")
+print(f"Total solar generated:              {total_solar_mwh:>8.1f} MWh  (100%)")
+print(f"  → Direct to plant (solar):        {solar_direct_mwh:>8.1f} MWh  ({solar_direct_mwh/total_solar_mwh*100:.1f}%)")
+print(f"  → Into battery (input):           {solar_to_bat_mwh:>8.1f} MWh  ({solar_to_bat_mwh/total_solar_mwh*100:.1f}%)")
+print(f"  → Curtailed / wasted:             {curtailed_mwh:>8.1f} MWh  ({curtailed_mwh/total_solar_mwh*100:.1f}%)")
+print(f"Battery → plant:                    {bat_discharged_mwh*eta_discharge:>8.1f} MWh")
+print(f"Battery losses:                     {bat_losses_mwh:>8.1f} MWh")
+print(f"Battery level at year-end:          {final_battery_mwh:>8.2f} MWh")
+print(f"Total plant energy:                 {total_ammonia_mwh:>8.1f} MWh  (target: {annual_target_mwh:.1f} MWh)")
+print(f"  → Electrolyzer (7 kWh/kg, {7/10*100:.0f}%): {total_elec_mwh:>8.1f} MWh")
+print(f"  → Haber-Bosch  (3 kWh/kg, {3/10*100:.0f}%): {total_hb_mwh:>8.1f} MWh")
+print(f"Monthly target met:                 {months_met}/12 months\n")
+
+for month in range(1, 13):
+    produced = sim_result["monthly_energy_used_kwh"][month]
+    target   = monthly_ammonia_energy_kwh
+    elec_kwh = produced * (7.0 / 10.0)
+    hb_kwh   = produced * (3.0 / 10.0)
+    status   = "OK" if produced >= target else f"short by {target - produced:,.0f} kWh"
+    print(f"  Month {month:2d}: total {produced:>9,.0f} kWh "
+          f"(elec {elec_kwh:,.0f} + HB {hb_kwh:,.0f}) / {target:,.0f} kWh  [{status}]")
+
+# --------------------------------------------------
+# Plant state statistics
+# --------------------------------------------------
+
+state_series = sim_result["plant_state_num"]
+state_names  = {0: "Off", 1: "Ramp-up", 2: "Standby", 3: "Producing", 4: "Ramp-down"}
+total_hours  = len(state_series)
+
+print("\n--- Plant state statistics ---")
+for code, name in state_names.items():
+    hours = int((state_series == code).sum())
+    pct   = hours / total_hours * 100
+    print(f"  {name:<12}: {hours:>5} h  ({pct:.1f}%)")
+
+# Monthly solar available for this field
+monthly_solar_sim_kwh = monthly_energy_per_m2_kwh * sim_field_area_m2
+
+# --------------------------------------------------
+# Per-month battery charging / discharging from storage_level
+# --------------------------------------------------
+
+storage = sim_result["storage_level"]
+monthly_bat_charged_kwh   = []
+monthly_bat_discharged_kwh = []
+start_idx = 0
+for month_hours in hours_per_month:
+    end_idx = start_idx + month_hours
+    charged = 0.0
+    discharged = 0.0
+    for i in range(start_idx, end_idx):
+        prev = float(storage.iloc[i - 1]) if i > 0 else 0.0
+        delta = float(storage.iloc[i]) - prev
+        if delta > 0:
+            charged += delta
+        else:
+            discharged -= delta
+    monthly_bat_charged_kwh.append(charged * 1000)
+    monthly_bat_discharged_kwh.append(discharged * 1000)
+    start_idx = end_idx
+
+monthly_bat_charged_kwh    = pd.Series(monthly_bat_charged_kwh,    index=range(1, 13))
+monthly_bat_discharged_kwh = pd.Series(monthly_bat_discharged_kwh, index=range(1, 13))
+
+# Solar splits per month (all in kWh):
+#   solar_available = solar_to_plant_direct + solar_to_battery + curtailed
+solar_to_bat_kwh          = monthly_bat_charged_kwh / eta_charge   # raw solar consumed to charge battery
+bat_contribution_kwh      = monthly_bat_discharged_kwh * eta_discharge  # battery energy delivered to plant
+solar_to_plant_direct_kwh = (sim_result["monthly_energy_used_kwh"] - bat_contribution_kwh).clip(lower=0)
+curtailed_monthly_kwh     = (monthly_solar_sim_kwh - solar_to_plant_direct_kwh - solar_to_bat_kwh).clip(lower=0)
+
+# --------------------------------------------------
+# 5. Monthly solar allocation: stacked breakdown
 # --------------------------------------------------
 
 months = range(1, 13)
+bottom_bat = solar_to_plant_direct_kwh
+bottom_curt = solar_to_plant_direct_kwh + solar_to_bat_kwh
+
 plt.figure()
-plt.bar(months, opt_result["monthly_energy_used_kwh"], label="Produced energy", alpha=0.7)
-plt.plot(months, monthly_target_kwh, color="red", marker="o", linestyle="-", linewidth=2, label="Ammonia target")
+plt.bar(months, solar_to_plant_direct_kwh, label="Solar → plant (direct)",
+        color="steelblue")
+plt.bar(months, solar_to_bat_kwh, bottom=bottom_bat,
+        label="Solar → battery (stored)", color="mediumseagreen")
+plt.bar(months, curtailed_monthly_kwh, bottom=bottom_curt,
+        label="Curtailed (wasted)", color="lightcoral")
+plt.plot(months, sim_result["monthly_energy_used_kwh"], "s--",
+         color="navy", linewidth=1.8, label="Total to plant (incl. battery)")
+plt.plot(months, monthly_target_energy_kwh, "o-",
+         color="red", linewidth=2, label="Ammonia target")
 plt.xlabel("Month")
 plt.ylabel("Energy [kWh]")
-plt.title("Monthly Solar Energy Used for Ammonia vs Target")
+plt.title(f"Monthly solar allocation — {sim_field_area_m2:,} m², "
+          f"{sim_electrolyzer_mw} MW electrolyzer, {sim_storage_mwh} MWh battery")
 plt.xticks(months)
-plt.legend()
+plt.legend(loc="upper right")
 plt.grid(axis="y", linestyle="--", alpha=0.5)
 plt.tight_layout()
 plt.show()
 
 # --------------------------------------------------
-# 6. Plot hourly PV output for optimal solar field
+# 6. Annual energy breakdown (pie chart)
 # --------------------------------------------------
 
+pie_labels = ["Electrolyzer\n(direct solar)", "Electrolyzer\n(from battery)",
+              "Battery losses", "Curtailed", "Left in battery"]
+pie_values = [solar_direct_mwh, bat_discharged_mwh * eta_discharge,
+              bat_losses_mwh, max(0.0, curtailed_mwh), final_battery_mwh]
+pie_colors = ["steelblue", "cornflowerblue", "salmon", "lightgray", "mediumseagreen"]
+
 plt.figure()
-plt.plot(hourly_energy_per_m2_kwh * opt_field_area_m2)
-plt.xlabel("Hour of the year")
-plt.ylabel("PV output [kWh] per hour")
-plt.title(f"Hourly PV output — optimal field ({opt_field_area_m2:,.0f} m², {opt_pv_mw:.2f} MW)")
-plt.grid(True)
+plt.pie(pie_values, labels=pie_labels, colors=pie_colors, autopct="%1.1f%%", startangle=90)
+plt.title(f"Annual solar energy split — total {total_solar_mwh:.1f} MWh")
 plt.tight_layout()
 plt.show()
 
 # --------------------------------------------------
-# 7. Plot battery storage level over the year
+# 7. Battery storage level over the year
 # --------------------------------------------------
 
 plt.figure()
-plt.fill_between(range(8760), opt_result["storage_level"], alpha=0.4, label="Storage level")
-plt.plot(opt_result["storage_level"], linewidth=0.6)
-plt.axhline(opt_storage_mwh, color="red", linestyle="--", linewidth=1.5, label=f"Capacity ({opt_storage_mwh:.0f} MWh)")
+plt.fill_between(range(8760), sim_result["storage_level"], alpha=0.4, color="cornflowerblue", label="Storage level")
+plt.plot(sim_result["storage_level"], linewidth=0.6, color="steelblue")
+plt.axhline(sim_storage_mwh, color="red", linestyle="--", linewidth=1.5,
+            label=f"Capacity ({sim_storage_mwh} MWh)")
 plt.xlabel("Hour of the year")
 plt.ylabel("Battery level [MWh]")
-plt.title(f"Battery storage level — {opt_storage_mwh:.0f} MWh capacity")
+plt.title(f"Battery storage level — {sim_storage_mwh} MWh capacity")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
 
 # --------------------------------------------------
-# 8. Plot hourly electrolyzer production
+# 8. Hourly power split: electrolyzer vs Haber-Bosch
 # --------------------------------------------------
 
+hours = range(8760)
+elec_mw = sim_result["electrolyzer_power_mw"]
+hb_mw   = sim_result["hb_power_mw"]
+
 plt.figure()
-plt.fill_between(range(8760), opt_result["ammonia_power_used_mw"], alpha=0.4, label="Electrolyzer output")
-plt.plot(opt_result["ammonia_power_used_mw"], linewidth=0.6)
-plt.axhline(opt_limit_mw, color="red", linestyle="--", linewidth=1.5, label=f"Limit ({opt_limit_mw:.1f} MW)")
+plt.fill_between(hours, elec_mw, alpha=0.7, color="steelblue", label=f"Electrolyzer (7 kWh/kg)")
+plt.fill_between(hours, elec_mw, elec_mw + hb_mw, alpha=0.7, color="darkorange",
+                 label=f"Haber-Bosch loop (3 kWh/kg)")
+plt.axhline(sim_electrolyzer_mw, color="steelblue", linestyle="--", linewidth=1,
+            label=f"Electrolyzer limit ({sim_electrolyzer_mw} MW)")
+plt.axhline(sim_electrolyzer_mw * (10.0 / 7.0), color="red", linestyle="--", linewidth=1,
+            label=f"Total plant limit ({sim_electrolyzer_mw * (10/7):.2f} MW)")
 plt.xlabel("Hour of the year")
-plt.ylabel("Power to electrolyzer [MW]")
-plt.title(f"Hourly electrolyzer production — {opt_limit_mw:.1f} MW limit")
+plt.ylabel("Power [MW]")
+plt.title(f"Hourly power — electrolyzer ({sim_electrolyzer_mw} MW) + Haber-Bosch loop")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.show() 
+plt.show()
+
+# --------------------------------------------------
+# 9. Hourly PV output for the simulated field
+# --------------------------------------------------
+
+plt.figure()
+plt.plot(hourly_energy_per_m2_kwh * sim_field_area_m2, linewidth=0.6, color="orange")
+plt.xlabel("Hour of the year")
+plt.ylabel("PV output [kWh] per hour")
+plt.title(f"Hourly PV output — {sim_field_area_m2:,} m²  ({sim_pv_mw:.3f} MW peak)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --------------------------------------------------
+# 10. Plant state percentage bar chart
+# --------------------------------------------------
+
+state_codes   = [0, 1, 2, 3, 4]
+state_labels  = ["Off", "Ramp-up", "Standby", "Producing", "Ramp-down"]
+state_colors  = ["lightgray", "orange", "gold", "steelblue", "salmon"]
+counts        = [(state_series == c).sum() for c in state_codes]
+percentages   = [c / total_hours * 100 for c in counts]
+
+plt.figure()
+bars = plt.bar(state_labels, percentages, color=state_colors, edgecolor="black", linewidth=0.5)
+for bar, pct, hrs in zip(bars, percentages, counts):
+    plt.text(bar.get_x() + bar.get_width() / 2,
+             bar.get_height() + 0.3,
+             f"{pct:.1f}%\n({hrs} h)",
+             ha="center", va="bottom", fontsize=9)
+plt.ylabel("Time [%]")
+plt.title("Plant state distribution — fraction of year")
+plt.ylim(0, max(percentages) * 1.2)
+plt.grid(axis="y", linestyle="--", alpha=0.5)
+plt.tight_layout()
+plt.show()
