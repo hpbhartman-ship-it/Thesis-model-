@@ -1,0 +1,25 @@
+Stap 1 is simuleren ipv optimaliseren:
+
+-> Waardes uit FESM halen voor batterij etc en dan simuleren wat dit allemaal doet etc.
+
+uit eerste optimalisatie komt voor 300 ton per jaar:
+-solar field area: 12,566 m² (2.26 MW installed) -
+Optimal electrolyzer limit: 0.50 MW -
+Optimal battery capacity: 7 MWh  
+
+FESM geeft voor 1,300,000 ton per jaar:
+Solar 5474 MW 
+Battery 11153 MWh
+Electolyzer 1565 MW
+
+Als je zou schalen zouden model waardes, 1.8x, 2.7x en 1,4x hoger liggen.
+
+Mar voor nu prima om volgende waarden aan te nemen:
+Solar 12500 m²
+Battery 7.5 MWh
+Electolyzer 0.5 MW
+
+
+-> Look also to ramp up and ramp down
+-> Can this be done faster by piutting more energy in this process or leads to faster degradation?
+
